@@ -1,34 +1,26 @@
-"""
-State Change Detection App using Dash (by Plotly)
-This application analyzes Empatica wristband data to detect psychological state changes.
-"""
-
-import base64
-import datetime
-import io
-import json
-import tempfile
-import os
-
 import dash
-from dash import dcc, html, Input, Output, State, callback, ctx, no_update
+from dash import dcc, html
+from dash.dependencies import Input, Output, State
+from dash.exceptions import PreventUpdate
 import dash_bootstrap_components as dbc
 import pandas as pd
 import numpy as np
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
+import plotly.graph_objs as go
+import base64
+import io
+from scipy.signal import find_peaks
 
-# Initialize the Dash app with Bootstrap styling
+# Initialize the Dash app
 app = dash.Dash(__name__, external_stylesheets=[dbc.themes.BOOTSTRAP])
-server = app.server
+server = app.server  # Expose server for Gunicorn
 
-# Define the layout
+# Define the app layout
 app.layout = html.Div([
     dbc.Container([
         html.H1("State Change Detection for Empatica Wristband", className="text-center my-4"),
-        html.P("Upload your Empatica wristband data files to detect psychological state changes", 
-               className="lead text-center mb-5"),
+        html.P("Upload your Empatica wristband data files to detect psychological state changes", className="text-center mb-5"),
         
+        # File upload section
         dbc.Card([
             dbc.CardHeader(html.H4("Upload Data Files")),
             dbc.CardBody([
@@ -78,6 +70,7 @@ app.layout = html.Div([
                         html.Div(id='pulse-upload-status')
                     ], md=6)
                 ]),
+                
                 dbc.Row([
                     dbc.Col([
                         html.Label("Temperature Data (CSV)"),
@@ -191,6 +184,21 @@ app.layout = html.Div([
                 
                 dbc.Row([
                     dbc.Col([
+                        html.Label("Peak Detection Sensitivity: ", className="mt-3"),
+                        html.Span(id="sensitivity-value", children="0.7"),
+                        dcc.Slider(
+                            id='sensitivity-slider',
+                            min=0.3,
+                            max=1.0,
+                            step=0.05,
+                            value=0.7,
+                            marks={i/10: str(i/10) for i in range(3, 11, 1)}
+                        )
+                    ], md=12)
+                ]),
+                
+                dbc.Row([
+                    dbc.Col([
                         dbc.Button("Process Data", id="process-btn", color="primary", className="w-100 mt-4", disabled=True)
                     ], md=12)
                 ])
@@ -240,83 +248,140 @@ def parse_contents(contents, filename):
     
     try:
         if 'csv' in filename:
-            # Save to temporary file
-            with tempfile.NamedTemporaryFile(suffix='.csv', delete=False) as temp:
-                temp.write(decoded)
-                temp_path = temp.name
-            
-            return temp_path, True, f"Uploaded: {filename}"
+            # Save to temp file
+            temp_file = io.StringIO(decoded.decode('utf-8'))
+            return temp_file, f"Uploaded: {filename}"
         else:
-            return None, False, "Please upload a CSV file."
+            return None, f"Error: {filename} is not a CSV file"
     except Exception as e:
-        return None, False, f"Error processing file: {e}"
+        return None, f"Error processing {filename}: {str(e)}"
 
-# Callback for file uploads
+# Callback for EDA file upload
 @app.callback(
     [Output('eda-upload-status', 'children'),
-     Output('pulse-upload-status', 'children'),
-     Output('temp-upload-status', 'children'),
-     Output('accel-upload-status', 'children'),
-     Output('process-btn', 'disabled')],
-    [Input('upload-eda', 'contents'),
-     Input('upload-pulse', 'contents'),
-     Input('upload-temp', 'contents'),
-     Input('upload-accel', 'contents')],
+     Output('process-btn', 'disabled', allow_duplicate=True)],
+    [Input('upload-eda', 'contents')],
     [State('upload-eda', 'filename'),
-     State('upload-pulse', 'filename'),
-     State('upload-temp', 'filename'),
-     State('upload-accel', 'filename')]
+     State('upload-pulse', 'contents'),
+     State('upload-temp', 'contents'),
+     State('upload-accel', 'contents')],
+    prevent_initial_call=True
 )
-def update_output(eda_contents, pulse_contents, temp_contents, accel_contents,
-                 eda_filename, pulse_filename, temp_filename, accel_filename):
+def update_eda_upload(contents, filename, pulse_contents, temp_contents, accel_contents):
+    if contents is None:
+        return "No file uploaded.", True
     
-    # Initialize outputs
-    eda_status = no_update
-    pulse_status = no_update
-    temp_status = no_update
-    accel_status = no_update
-    
-    # Check which input triggered the callback
-    triggered_id = ctx.triggered_id
-    
-    if triggered_id == 'upload-eda' and eda_contents:
-        temp_path, success, message = parse_contents(eda_contents, eda_filename)
-        if success:
-            app.temp_files['eda'] = temp_path
-        eda_status = html.Div(message, style={'color': 'green' if success else 'red'})
-    
-    elif triggered_id == 'upload-pulse' and pulse_contents:
-        temp_path, success, message = parse_contents(pulse_contents, pulse_filename)
-        if success:
-            app.temp_files['pulse'] = temp_path
-        pulse_status = html.Div(message, style={'color': 'green' if success else 'red'})
-    
-    elif triggered_id == 'upload-temp' and temp_contents:
-        temp_path, success, message = parse_contents(temp_contents, temp_filename)
-        if success:
-            app.temp_files['temp'] = temp_path
-        temp_status = html.Div(message, style={'color': 'green' if success else 'red'})
-    
-    elif triggered_id == 'upload-accel' and accel_contents:
-        temp_path, success, message = parse_contents(accel_contents, accel_filename)
-        if success:
-            app.temp_files['accel'] = temp_path
-        accel_status = html.Div(message, style={'color': 'green' if success else 'red'})
+    temp_file, message = parse_contents(contents, filename)
+    app.temp_files['eda'] = temp_file
     
     # Enable process button if all files are uploaded
-    process_disabled = not all(app.temp_files.values())
+    all_files_uploaded = all([
+        app.temp_files['eda'] is not None,
+        app.temp_files['pulse'] is not None,
+        app.temp_files['temp'] is not None,
+        app.temp_files['accel'] is not None
+    ])
     
-    return eda_status, pulse_status, temp_status, accel_status, process_disabled
+    return message, not all_files_uploaded
 
-# Callback for window size selection buttons
+# Callback for pulse rate file upload
+@app.callback(
+    [Output('pulse-upload-status', 'children'),
+     Output('process-btn', 'disabled', allow_duplicate=True)],
+    [Input('upload-pulse', 'contents')],
+    [State('upload-pulse', 'filename'),
+     State('upload-eda', 'contents'),
+     State('upload-temp', 'contents'),
+     State('upload-accel', 'contents')],
+    prevent_initial_call=True
+)
+def update_pulse_upload(contents, filename, eda_contents, temp_contents, accel_contents):
+    if contents is None:
+        return "No file uploaded.", True
+    
+    temp_file, message = parse_contents(contents, filename)
+    app.temp_files['pulse'] = temp_file
+    
+    # Enable process button if all files are uploaded
+    all_files_uploaded = all([
+        app.temp_files['eda'] is not None,
+        app.temp_files['pulse'] is not None,
+        app.temp_files['temp'] is not None,
+        app.temp_files['accel'] is not None
+    ])
+    
+    return message, not all_files_uploaded
+
+# Callback for temperature file upload
+@app.callback(
+    [Output('temp-upload-status', 'children'),
+     Output('process-btn', 'disabled', allow_duplicate=True)],
+    [Input('upload-temp', 'contents')],
+    [State('upload-temp', 'filename'),
+     State('upload-eda', 'contents'),
+     State('upload-pulse', 'contents'),
+     State('upload-accel', 'contents')],
+    prevent_initial_call=True
+)
+def update_temp_upload(contents, filename, eda_contents, pulse_contents, accel_contents):
+    if contents is None:
+        return "No file uploaded.", True
+    
+    temp_file, message = parse_contents(contents, filename)
+    app.temp_files['temp'] = temp_file
+    
+    # Enable process button if all files are uploaded
+    all_files_uploaded = all([
+        app.temp_files['eda'] is not None,
+        app.temp_files['pulse'] is not None,
+        app.temp_files['temp'] is not None,
+        app.temp_files['accel'] is not None
+    ])
+    
+    return message, not all_files_uploaded
+
+# Callback for accelerometers file upload
+@app.callback(
+    [Output('accel-upload-status', 'children'),
+     Output('process-btn', 'disabled', allow_duplicate=True)],
+    [Input('upload-accel', 'contents')],
+    [State('upload-accel', 'filename'),
+     State('upload-eda', 'contents'),
+     State('upload-pulse', 'contents'),
+     State('upload-temp', 'contents')],
+    prevent_initial_call=True
+)
+def update_accel_upload(contents, filename, eda_contents, pulse_contents, temp_contents):
+    if contents is None:
+        return "No file uploaded.", True
+    
+    temp_file, message = parse_contents(contents, filename)
+    app.temp_files['accel'] = temp_file
+    
+    # Enable process button if all files are uploaded
+    all_files_uploaded = all([
+        app.temp_files['eda'] is not None,
+        app.temp_files['pulse'] is not None,
+        app.temp_files['temp'] is not None,
+        app.temp_files['accel'] is not None
+    ])
+    
+    return message, not all_files_uploaded
+
+# Callback for window size selection
 @app.callback(
     Output('window-sizes', 'value'),
     [Input('select-all-btn', 'n_clicks'),
      Input('deselect-all-btn', 'n_clicks')],
     [State('window-sizes', 'options'),
-     State('window-sizes', 'value')]
+     State('window-sizes', 'value')],
+    prevent_initial_call=True
 )
 def update_window_sizes(select_clicks, deselect_clicks, options, current_value):
+    ctx = dash.callback_context
+    if not ctx.triggered:
+        return current_value
+    
     if ctx.triggered_id == 'select-all-btn':
         return [option['value'] for option in options]
     elif ctx.triggered_id == 'deselect-all-btn':
@@ -339,13 +404,21 @@ def update_threshold_value(value):
 def update_overlap_value(value):
     return f"{value}"
 
+# Callback to update sensitivity value display
+@app.callback(
+    Output('sensitivity-value', 'children'),
+    [Input('sensitivity-slider', 'value')]
+)
+def update_sensitivity_value(value):
+    return f"{value:.2f}"
+
 # State Change Detection Algorithm
 class StateChangeDetector:
     """
-    Class for detecting psychological state changes from biomarker data.
+    Algorithm for detecting psychological state changes from Empatica wristband data.
     """
     
-    def __init__(self, threshold: float = 2.0, window_sizes: list = None, overlap_percent: float = 0):
+    def __init__(self, threshold=2.0, window_sizes=None, overlap_percent=0, sensitivity=0.7):
         """
         Initialize the state change detector.
         
@@ -353,10 +426,12 @@ class StateChangeDetector:
             threshold: Number of standard deviations to consider a change significant
             window_sizes: List of window sizes in minutes to analyze
             overlap_percent: Percentage of overlap between consecutive windows (0-100)
+            sensitivity: Sensitivity factor for peak detection (0.3-1.0)
         """
         self.threshold = threshold
         self.window_sizes = window_sizes or [3, 4, 5, 6, 8, 10, 15, 20, 30]
         self.overlap_percent = max(0, min(overlap_percent, 100))  # Ensure between 0-100%
+        self.sensitivity = max(0.3, min(sensitivity, 1.0))  # Ensure between 0.3-1.0
         
     def load_data(self, eda_file, pulse_rate_file, temperature_file, accelerometers_file):
         """
@@ -443,7 +518,7 @@ class StateChangeDetector:
             
             for window_size in self.window_sizes:
                 # Calculate rolling statistics
-                window_changes = self._detect_changes_for_window(data, value_column, window_size)
+                window_changes = self._detect_changes_for_window(data, value_column, window_size, biomarker)
                 
                 if window_changes:
                     all_changes[biomarker][window_size] = window_changes
@@ -462,7 +537,7 @@ class StateChangeDetector:
             'biomarker_data': biomarker_data
         }
     
-    def _detect_changes_for_window(self, data: pd.DataFrame, value_column: str, window_size: int) -> list:
+    def _detect_changes_for_window(self, data: pd.DataFrame, value_column: str, window_size: int, biomarker: str) -> list:
         """
         Detect significant changes for a specific window size.
         
@@ -470,6 +545,7 @@ class StateChangeDetector:
             data: Biomarker dataframe
             value_column: Name of the column containing the biomarker values
             window_size: Window size in minutes
+            biomarker: Name of the biomarker being analyzed
             
         Returns:
             List of detected changes
@@ -521,10 +597,153 @@ class StateChangeDetector:
                         'window_size': window_size,
                         'window_start': data['timestamp'].iloc[start_idx],
                         'window_end': data['timestamp'].iloc[i-1],
-                        'overlap_percent': self.overlap_percent
+                        'overlap_percent': self.overlap_percent,
+                        'detection_type': 'window_change'
                     })
         
+        # Add peak detection for significant local maxima and minima
+        self._add_peak_detections(data, value_column, window_size, changes, biomarker)
+        
         return changes
+    
+    def _add_peak_detections(self, data: pd.DataFrame, value_column: str, window_size: int, changes: list, biomarker: str):
+        """
+        Add peak detections based on local maxima and minima.
+        
+        Args:
+            data: Input dataframe
+            value_column: Name of the column containing the biomarker values
+            window_size: Window size in minutes
+            changes: List of existing changes to append to
+            biomarker: Name of the biomarker being analyzed
+        """
+        if len(data) < window_size * 2:
+            return  # Not enough data for peak detection
+            
+        # Calculate rolling mean and standard deviation for the entire dataset
+        # This helps establish a baseline for peak detection
+        rolling_mean = data[value_column].rolling(window=window_size, center=True).mean()
+        rolling_std = data[value_column].rolling(window=window_size, center=True).std()
+        
+        # Fill NaN values at the edges
+        rolling_mean = rolling_mean.fillna(method='bfill').fillna(method='ffill')
+        rolling_std = rolling_std.fillna(method='bfill').fillna(method='ffill')
+        
+        # Adjust threshold based on sensitivity factor
+        adjusted_threshold = self.threshold * self.sensitivity
+        
+        # Find peaks (local maxima)
+        # We use scipy.signal.find_peaks which identifies local maxima in the data
+        values = data[value_column].values
+        
+        # For peaks above the mean
+        # Height parameter ensures we only detect peaks that exceed the threshold
+        # Distance parameter ensures peaks are not too close to each other
+        peaks, peak_properties = find_peaks(
+            values, 
+            height=rolling_mean + (rolling_std * adjusted_threshold),
+            distance=max(3, window_size // 3)  # Minimum distance between peaks
+        )
+        
+        # For troughs below the mean
+        # We invert the signal to find troughs as peaks
+        troughs, trough_properties = find_peaks(
+            -values, 
+            height=-(rolling_mean - (rolling_std * adjusted_threshold)),
+            distance=max(3, window_size // 3)
+        )
+        
+        # Process peaks
+        for peak_idx in peaks:
+            if peak_idx >= len(data):
+                continue
+                
+            peak_value = data.iloc[peak_idx][value_column]
+            peak_time = data.iloc[peak_idx]['timestamp']
+            
+            # Calculate local z-score relative to surrounding data
+            start_idx = max(0, peak_idx - window_size)
+            end_idx = min(len(data), peak_idx + window_size)
+            local_data = data.iloc[start_idx:end_idx]
+            local_mean = local_data[value_column].mean()
+            local_std = local_data[value_column].std()
+            
+            if local_std == 0 or np.isnan(local_std):
+                continue
+                
+            z_score = abs(peak_value - local_mean) / local_std
+            
+            # Only add if z-score exceeds threshold and not too close to existing changes
+            if z_score > adjusted_threshold:
+                # Check if this peak is already covered by an existing change
+                is_duplicate = False
+                for change in changes:
+                    time_diff = abs((peak_time - change['timestamp']).total_seconds())
+                    if time_diff < window_size * 60 / 2:  # Half window size in seconds
+                        is_duplicate = True
+                        break
+                
+                if not is_duplicate:
+                    changes.append({
+                        'timestamp': peak_time,
+                        'value': peak_value,
+                        'previous_mean': local_mean,
+                        'previous_std': local_std,
+                        'z_score': z_score,
+                        'direction': 'increase',
+                        'window_size': window_size,
+                        'window_start': local_data.iloc[0]['timestamp'],
+                        'window_end': local_data.iloc[-1]['timestamp'],
+                        'overlap_percent': self.overlap_percent,
+                        'detection_type': 'peak',
+                        'biomarker': biomarker
+                    })
+        
+        # Process troughs
+        for trough_idx in troughs:
+            if trough_idx >= len(data):
+                continue
+                
+            trough_value = data.iloc[trough_idx][value_column]
+            trough_time = data.iloc[trough_idx]['timestamp']
+            
+            # Calculate local z-score
+            start_idx = max(0, trough_idx - window_size)
+            end_idx = min(len(data), trough_idx + window_size)
+            local_data = data.iloc[start_idx:end_idx]
+            local_mean = local_data[value_column].mean()
+            local_std = local_data[value_column].std()
+            
+            if local_std == 0 or np.isnan(local_std):
+                continue
+                
+            z_score = abs(trough_value - local_mean) / local_std
+            
+            # Only add if z-score exceeds threshold and not too close to existing changes
+            if z_score > adjusted_threshold:
+                # Check if this trough is already covered by an existing change
+                is_duplicate = False
+                for change in changes:
+                    time_diff = abs((trough_time - change['timestamp']).total_seconds())
+                    if time_diff < window_size * 60 / 2:  # Half window size in seconds
+                        is_duplicate = True
+                        break
+                
+                if not is_duplicate:
+                    changes.append({
+                        'timestamp': trough_time,
+                        'value': trough_value,
+                        'previous_mean': local_mean,
+                        'previous_std': local_std,
+                        'z_score': z_score,
+                        'direction': 'decrease',
+                        'window_size': window_size,
+                        'window_start': local_data.iloc[0]['timestamp'],
+                        'window_end': local_data.iloc[-1]['timestamp'],
+                        'overlap_percent': self.overlap_percent,
+                        'detection_type': 'trough',
+                        'biomarker': biomarker
+                    })
     
     def _cross_validate_changes(self, all_changes: dict) -> dict:
         """
@@ -548,71 +767,95 @@ class StateChangeDetector:
                 for change in changes:
                     all_timestamps.add(change['timestamp'])
             
-            # Count occurrences of each timestamp across window sizes
-            timestamp_counts = {}
+            # Group changes by timestamp
+            grouped_changes = {}
             for timestamp in all_timestamps:
-                count = 0
+                # Find changes across window sizes that match this timestamp
+                matching_changes = []
                 for window_size, changes in window_changes.items():
                     for change in changes:
-                        if change['timestamp'] == timestamp:
-                            count += 1
-                            break
-                timestamp_counts[timestamp] = count
-            
-            # Filter timestamps that appear in at least 2 window sizes
-            validated_timestamps = [ts for ts, count in timestamp_counts.items() if count >= 2]
-            
-            # Get the details of validated changes
-            validated_changes[biomarker] = []
-            for timestamp in validated_timestamps:
-                # Find the change with the highest z-score for this timestamp
-                best_change = None
-                best_z_score = 0
+                        # Check if timestamps are close (within 1 minute)
+                        time_diff = abs((timestamp - change['timestamp']).total_seconds())
+                        if time_diff <= 60:  # 1 minute in seconds
+                            matching_changes.append(change)
                 
-                for window_size, changes in window_changes.items():
-                    for change in changes:
-                        if change['timestamp'] == timestamp and change['z_score'] > best_z_score:
-                            best_change = change
-                            best_z_score = change['z_score']
+                # Only keep timestamp if it appears in at least 2 window sizes
+                # or if it's a peak/trough detection (which are more reliable)
+                window_sizes_count = len(set(change['window_size'] for change in matching_changes))
+                has_peak_detection = any(change.get('detection_type') in ['peak', 'trough'] for change in matching_changes)
                 
-                if best_change:
-                    validated_changes[biomarker].append(best_change)
+                if window_sizes_count >= 2 or has_peak_detection:
+                    # Use the change with the highest z-score
+                    best_change = max(matching_changes, key=lambda x: x['z_score'])
+                    grouped_changes[timestamp] = best_change
+            
+            validated_changes[biomarker] = list(grouped_changes.values())
         
         return validated_changes
     
     def _integrate_biomarker_changes(self, validated_changes: dict) -> list:
         """
-        Integrate changes across different biomarkers.
+        Integrate changes across biomarkers.
         
         Args:
             validated_changes: Dictionary containing validated changes for each biomarker
             
         Returns:
-            List of integrated state changes
+            List of integrated changes
         """
-        # Get all unique timestamps across all biomarkers
-        all_timestamps = set()
+        # Flatten all changes across biomarkers
+        all_changes = []
         for biomarker, changes in validated_changes.items():
             for change in changes:
-                all_timestamps.add(change['timestamp'])
+                all_changes.append({
+                    'biomarker': biomarker,
+                    'timestamp': change['timestamp'],
+                    'z_score': change['z_score'],
+                    'direction': change['direction'],
+                    'window_size': change['window_size'],
+                    'overlap_percent': change['overlap_percent'],
+                    'window_start': change['window_start'],
+                    'window_end': change['window_end'],
+                    'detection_type': change.get('detection_type', 'window_change')
+                })
         
-        # Group changes by timestamp
+        # Sort changes by timestamp
+        all_changes.sort(key=lambda x: x['timestamp'])
+        
+        # Group changes by timestamp (within a 2-minute window)
         grouped_changes = {}
-        for timestamp in all_timestamps:
-            grouped_changes[timestamp] = {}
+        for change in all_changes:
+            # Find if there's a close timestamp already in the groups
+            found_match = False
+            for timestamp in list(grouped_changes.keys()):
+                time_diff = abs((timestamp - change['timestamp']).total_seconds())
+                if time_diff <= 120:  # 2 minutes in seconds
+                    grouped_changes[timestamp][change['biomarker']] = change
+                    found_match = True
+                    break
             
-            for biomarker, changes in validated_changes.items():
-                for change in changes:
-                    if change['timestamp'] == timestamp:
-                        grouped_changes[timestamp][biomarker] = change
+            if not found_match:
+                grouped_changes[change['timestamp']] = {change['biomarker']: change}
         
         # Filter timestamps with changes in at least 2 biomarkers
+        # or with high-confidence peak detections
         integrated_changes = []
         for timestamp, biomarker_changes in grouped_changes.items():
-            if len(biomarker_changes) >= 2:
-                # Calculate average z-score as confidence
+            # Check if we have multiple biomarkers or high-confidence peak detections
+            has_multiple_biomarkers = len(biomarker_changes) >= 2
+            has_peak_detection = any(
+                change.get('detection_type') in ['peak', 'trough'] and change['z_score'] > self.threshold * 1.5
+                for change in biomarker_changes.values()
+            )
+            
+            if has_multiple_biomarkers or has_peak_detection:
+                # Calculate average z-score
                 z_scores = [change['z_score'] for change in biomarker_changes.values()]
                 avg_z_score = sum(z_scores) / len(z_scores)
+                
+                # Calculate confidence percentage (0-100%)
+                # Using a sigmoid function to map z-scores to 0-100% range
+                confidence_pct = 100 * (1 / (1 + np.exp(-avg_z_score + self.threshold)))
                 
                 # Get window sizes and overlap info
                 window_sizes = {biomarker: change.get('window_size', 'N/A') for biomarker, change in biomarker_changes.items()}
@@ -627,18 +870,18 @@ class StateChangeDetector:
                     formatted_changes[biomarker] = {
                         'direction': change['direction'],
                         'z_score': change['z_score'],
-                        'value': change['value'],
-                        'previous_mean': change['previous_mean'],
-                        'window_size': change.get('window_size', 'N/A'),
+                        'window_size': change['window_size'],
                         'window_start': change.get('window_start', None),
-                        'window_end': change.get('window_end', None)
+                        'window_end': change.get('window_end', None),
+                        'detection_type': change.get('detection_type', 'window_change')
                     }
                 
                 # Add integrated change to list
                 integrated_changes.append({
                     'timestamp': timestamp,
                     'biomarkers': formatted_changes,
-                    'confidence': avg_z_score,
+                    'z_score': avg_z_score,
+                    'confidence_pct': confidence_pct,
                     'probable_transition': probable_transition,
                     'window_sizes': window_sizes,
                     'overlap_percent': overlap_percent
@@ -659,31 +902,25 @@ class StateChangeDetector:
         Returns:
             String describing the probable state transition
         """
-        # Check for patterns indicating specific transitions
-        
-        # Anxiety/Irritation pattern: Increased EDA, increased heart rate, decreased movement
-        anxiety_pattern = (
-            biomarker_changes.get('eda', {}).get('direction') == 'increase' and
-            biomarker_changes.get('pulse_rate', {}).get('direction') == 'increase' and
-            (
-                'accelerometers' not in biomarker_changes or
-                biomarker_changes.get('accelerometers', {}).get('direction') == 'decrease'
-            )
-        )
-        
-        if anxiety_pattern:
-            return "Neutral → Anxious/Irritated"
-        
-        # Calm/Relaxation pattern: Decreased EDA, decreased heart rate
-        calm_pattern = (
+        # Check for relaxation pattern
+        relaxation_pattern = (
             biomarker_changes.get('eda', {}).get('direction') == 'decrease' and
             biomarker_changes.get('pulse_rate', {}).get('direction') == 'decrease'
         )
         
-        if calm_pattern:
-            return "Anxious/Irritated → Neutral"
+        if relaxation_pattern:
+            return "Aroused → Relaxed"
         
-        # Excitement pattern: Increased EDA, increased heart rate, increased movement
+        # Check for stress/arousal pattern
+        stress_pattern = (
+            biomarker_changes.get('eda', {}).get('direction') == 'increase' and
+            biomarker_changes.get('pulse_rate', {}).get('direction') == 'increase'
+        )
+        
+        if stress_pattern:
+            return "Relaxed → Aroused"
+        
+        # Check for excitement pattern
         excitement_pattern = (
             biomarker_changes.get('eda', {}).get('direction') == 'increase' and
             biomarker_changes.get('pulse_rate', {}).get('direction') == 'increase' and
@@ -737,18 +974,25 @@ class StateChangeDetector:
     [Input('process-btn', 'n_clicks')],
     [State('threshold-slider', 'value'),
      State('window-sizes', 'value'),
-     State('overlap-slider', 'value')]
+     State('overlap-slider', 'value'),
+     State('sensitivity-slider', 'value')]
 )
-def process_data(n_clicks, threshold, window_sizes, overlap_percent):
+def process_data(n_clicks, threshold, window_sizes, overlap_percent, sensitivity):
     if n_clicks is None:
-        return no_update, no_update, no_update, no_update
+        from dash.exceptions import PreventUpdate
+        raise PreventUpdate
     
     # Check if all files are uploaded
     if not all(app.temp_files.values()):
-        return "Please upload all required files.", no_update, no_update, no_update
+        return "Please upload all required files.", {'display': 'none'}, None, None
     
     # Initialize state change detector with all parameters
-    detector = StateChangeDetector(threshold=threshold, window_sizes=window_sizes, overlap_percent=overlap_percent)
+    detector = StateChangeDetector(
+        threshold=threshold, 
+        window_sizes=window_sizes, 
+        overlap_percent=overlap_percent,
+        sensitivity=sensitivity
+    )
     
     # Load data
     detector.load_data(
@@ -773,10 +1017,12 @@ def process_data(n_clicks, threshold, window_sizes, overlap_percent):
             html.Thead(html.Tr([
                 html.Th("Timestamp"),
                 html.Th("Biomarker Changes"),
+                html.Th("Detection Type"),
                 html.Th("Window Sizes (min)"),
                 html.Th("Overlap (%)"),
                 html.Th("Probable Transition"),
-                html.Th("Confidence")
+                html.Th("Z-Score"),
+                html.Th("Confidence (%)")
             ])),
             html.Tbody([
                 html.Tr([
@@ -789,117 +1035,159 @@ def process_data(n_clicks, threshold, window_sizes, overlap_percent):
                     ])),
                     html.Td(html.Div([
                         html.Div([
+                            f"{details.get('detection_type', 'window_change')}"
+                        ]) for biomarker, details in change['biomarkers'].items()
+                    ])),
+                    html.Td(html.Div([
+                        html.Div([
                             f"{biomarker}: {size}"
                         ]) for biomarker, size in change['window_sizes'].items()
                     ])),
                     html.Td(f"{change['overlap_percent']}%"),
                     html.Td(change['probable_transition']),
-                    html.Td(f"{change['confidence']:.2f}")
+                    html.Td(f"{change['z_score']:.2f}"),
+                    html.Td(f"{change['confidence_pct']:.1f}%")
                 ]) for change in results['state_changes']
             ])
         ], striped=True, bordered=True, hover=True)
     
     # Create biomarker tabs
     tabs = []
-    for biomarker, data in results['biomarker_data'].items():
-        if not data:
-            continue
-        
+    
+    # Create a single figure with subplots for all biomarkers
+    biomarker_names = list(results['biomarker_data'].keys())
+    if biomarker_names:
+        # Create a figure with subplots (one row per biomarker)
         fig = go.Figure()
+        subplot_height = 250  # Height per subplot in pixels
+        total_height = subplot_height * len(biomarker_names)
         
-        # Add main data line
-        fig.add_trace(go.Scatter(
-            x=data['timestamps'],
-            y=data['values'],
-            mode='lines',
-            name=biomarker,
-            line=dict(color=get_color_for_biomarker(biomarker))
-        ))
+        # Calculate y-axis domains for each subplot
+        domains = []
+        for i in range(len(biomarker_names)):
+            domain_start = 1 - ((i + 1) / len(biomarker_names))
+            domain_end = 1 - (i / len(biomarker_names))
+            domains.append([domain_start, domain_end])
         
-        # Add markers for state changes
-        for change in results['state_changes']:
-            if biomarker in change['biomarkers']:
-                # Find the index of this timestamp
-                try:
-                    timestamp_str = change['timestamp'].strftime('%Y-%m-%d %H:%M:%S') if isinstance(change['timestamp'], pd.Timestamp) else str(change['timestamp'])
-                    if timestamp_str in data['timestamps']:
-                        idx = data['timestamps'].index(timestamp_str)
-                        
-                        # Get window information
-                        window_size = change['window_sizes'].get(biomarker, 'N/A')
-                        window_start = change['biomarkers'][biomarker].get('window_start', None)
-                        window_end = change['biomarkers'][biomarker].get('window_end', None)
-                        
-                        # Format window info for hover text
-                        window_info = ""
-                        if window_start and window_end:
-                            window_start_str = window_start.strftime('%H:%M:%S') if isinstance(window_start, pd.Timestamp) else str(window_start)
-                            window_end_str = window_end.strftime('%H:%M:%S') if isinstance(window_end, pd.Timestamp) else str(window_end)
-                            window_info = f"<br>Window: {window_start_str} to {window_end_str}<br>Window Size: {window_size} min<br>Overlap: {change['overlap_percent']}%"
-                        
-                        fig.add_trace(go.Scatter(
-                            x=[timestamp_str],
-                            y=[data['values'][idx]],
-                            mode='markers',
-                            marker=dict(
-                                size=12,
-                                color='red',
-                                symbol='circle-open',
-                                line=dict(width=2)
-                            ),
-                            name=f"State Change: {change['probable_transition']}",
-                            hoverinfo='text',
-                            hovertext=f"State Change: {change['probable_transition']}<br>"
-                                     f"Confidence: {change['confidence']:.2f}<br>"
-                                     f"Z-score: {change['biomarkers'][biomarker]['z_score']:.2f}"
-                                     f"{window_info}"
-                        ))
-                        
-                        # Add shaded area for the window if available
-                        if window_start and window_end:
-                            window_start_str = window_start.strftime('%Y-%m-%d %H:%M:%S') if isinstance(window_start, pd.Timestamp) else str(window_start)
-                            window_end_str = window_end.strftime('%Y-%m-%d %H:%M:%S') if isinstance(window_end, pd.Timestamp) else str(window_end)
+        # Add traces for each biomarker
+        for i, biomarker in enumerate(biomarker_names):
+            data = results['biomarker_data'][biomarker]
+            if not data:
+                continue
+            
+            # Add main data line
+            fig.add_trace(go.Scatter(
+                x=data['timestamps'],
+                y=data['values'],
+                mode='lines',
+                name=biomarker,
+                line=dict(color=get_color_for_biomarker(biomarker)),
+                yaxis=f'y{i+1}'
+            ))
+            
+            # Add markers for state changes
+            for change in results['state_changes']:
+                if biomarker in change['biomarkers']:
+                    # Find the index of this timestamp
+                    try:
+                        timestamp_str = change['timestamp'].strftime('%Y-%m-%d %H:%M:%S') if isinstance(change['timestamp'], pd.Timestamp) else str(change['timestamp'])
+                        if timestamp_str in data['timestamps']:
+                            idx = data['timestamps'].index(timestamp_str)
                             
-                            # Find indices for window start and end
-                            if window_start_str in data['timestamps'] and window_end_str in data['timestamps']:
-                                start_idx = data['timestamps'].index(window_start_str)
-                                end_idx = data['timestamps'].index(window_end_str)
+                            # Get window information
+                            window_size = change['window_sizes'].get(biomarker, 'N/A')
+                            window_start = change['biomarkers'][biomarker].get('window_start', None)
+                            window_end = change['biomarkers'][biomarker].get('window_end', None)
+                            detection_type = change['biomarkers'][biomarker].get('detection_type', 'window_change')
+                            
+                            # Format window info for hover text
+                            window_info = ""
+                            if window_start and window_end:
+                                window_start_str = window_start.strftime('%H:%M:%S') if isinstance(window_start, pd.Timestamp) else str(window_start)
+                                window_end_str = window_end.strftime('%H:%M:%S') if isinstance(window_end, pd.Timestamp) else str(window_end)
+                                window_info = f"<br>Window: {window_start_str} to {window_end_str}<br>Window Size: {window_size} min<br>Overlap: {change['overlap_percent']}%"
+                            
+                            # Use different marker symbols based on detection type
+                            marker_symbol = 'circle-open'
+                            if detection_type == 'peak':
+                                marker_symbol = 'triangle-up'
+                            elif detection_type == 'trough':
+                                marker_symbol = 'triangle-down'
+                            
+                            fig.add_trace(go.Scatter(
+                                x=[timestamp_str],
+                                y=[data['values'][idx]],
+                                mode='markers',
+                                marker=dict(
+                                    size=12,
+                                    color='red',
+                                    symbol=marker_symbol,
+                                    line=dict(width=2)
+                                ),
+                                name=f"{biomarker} Change",
+                                hoverinfo='text',
+                                hovertext=f"State Change: {change['probable_transition']}<br>"
+                                         f"Detection Type: {detection_type}<br>"
+                                         f"Z-Score: {change['z_score']:.2f}<br>"
+                                         f"Confidence: {change['confidence_pct']:.1f}%"
+                                         f"{window_info}",
+                                yaxis=f'y{i+1}'
+                            ))
+                            
+                            # Add shaded area for the window if available
+                            if window_start and window_end:
+                                window_start_str = window_start.strftime('%Y-%m-%d %H:%M:%S') if isinstance(window_start, pd.Timestamp) else str(window_start)
+                                window_end_str = window_end.strftime('%Y-%m-%d %H:%M:%S') if isinstance(window_end, pd.Timestamp) else str(window_end)
                                 
-                                # Add shaded area
-                                fig.add_trace(go.Scatter(
-                                    x=data['timestamps'][start_idx:end_idx+1],
-                                    y=data['values'][start_idx:end_idx+1],
-                                    fill='tozeroy',
-                                    fillcolor='rgba(0, 255, 0, 0.2)',
-                                    line=dict(color='rgba(0, 255, 0, 0.5)'),
-                                    name=f"Window ({window_size} min, {change['overlap_percent']}% overlap)",
-                                    hoverinfo='skip'
-                                ))
-                except (ValueError, IndexError):
-                    continue
+                                # Find indices for window start and end
+                                if window_start_str in data['timestamps'] and window_end_str in data['timestamps']:
+                                    start_idx = data['timestamps'].index(window_start_str)
+                                    end_idx = data['timestamps'].index(window_end_str)
+                                    
+                                    # Add shaded area
+                                    fig.add_trace(go.Scatter(
+                                        x=data['timestamps'][start_idx:end_idx+1],
+                                        y=data['values'][start_idx:end_idx+1],
+                                        fill='tozeroy',
+                                        fillcolor='rgba(0, 255, 0, 0.2)',
+                                        line=dict(color='rgba(0, 255, 0, 0.5)'),
+                                        name=f"Window",
+                                        hoverinfo='skip',
+                                        yaxis=f'y{i+1}'
+                                    ))
+                    except (ValueError, IndexError):
+                        continue
+            
+            # Create y-axis for this biomarker
+            fig.update_layout(**{
+                f'yaxis{i+1}': dict(
+                    title=f"{biomarker.replace('_', ' ').title()} ({get_biomarker_unit(biomarker)})",
+                    domain=domains[i],
+                    titlefont=dict(color=get_color_for_biomarker(biomarker)),
+                    tickfont=dict(color=get_color_for_biomarker(biomarker)),
+                    gridcolor='rgba(0,0,0,0.1)'
+                )
+            })
         
         # Update layout
         fig.update_layout(
-            title=f"{biomarker.replace('_', ' ').title()} Data",
-            xaxis_title="Time",
-            yaxis_title=get_biomarker_unit(biomarker),
+            title="Physiological Signals with Detected State Changes",
+            xaxis=dict(
+                title="Time",
+                domain=[0, 1]
+            ),
+            height=total_height + 150,  # Add extra space for title and x-axis
+            margin=dict(l=50, r=50, t=50, b=50),
             hovermode="closest",
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-            margin=dict(l=40, r=40, t=40, b=40)
+            showlegend=False
         )
         
-        # Create tab
-        tab = dbc.Tab(
-            dcc.Graph(figure=fig, style={'height': '500px'}),
-            label=biomarker.upper(),
-            tab_id=f"tab-{biomarker}"
-        )
-        tabs.append(tab)
-    
-    # Create tabs component
-    tabs_component = dbc.Tabs(tabs) if tabs else html.Div("No biomarker data available.")
-    
-    return "", {"display": "block"}, state_changes_table, tabs_component
+        # Create graph component
+        graph = dcc.Graph(figure=fig, style={'height': f'{total_height + 150}px'})
+        
+        return "", {"display": "block"}, state_changes_table, graph
+    else:
+        return "", {"display": "block"}, state_changes_table, html.Div("No biomarker data available.")
 
 def get_color_for_biomarker(biomarker):
     colors = {
